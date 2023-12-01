@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import math
 from collections.abc import Callable, Sequence
 
 import matplotlib
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 from generative.networks.nets import SPADEAutoencoderKL, SPADEDiffusionModelUNet
 from monai.inferers import Inferer
@@ -19,21 +17,80 @@ import matplotlib.pyplot as plt
 tqdm, has_tqdm = optional_import("tqdm", name="tqdm")
 
 
-def complex_conjugate_gradient(AHA, AHb, x0, max_iterations: int = 10, tolerance: float = 1e-6, lambda_l2=0):
-    """Conjugate gradient for complex numbers. The output is also complex.
-    Solve for argmin ||Ax - b||^2
+def normalize(x, per=0.01, out_range=(-1, 1), top=None, bottom=None, return_top_bottom=False):
+    """
+    Normalize the input tensor `x` based on percentiles and map it to the specified output range.
+    This will clamp the input tensor based on the specified percentiles (same for top and bottom),
+    then normalize it to the required range.
 
     Args:
-        AHA (linear operator):
-        AHb: see optimization definition
-        x0: initial guess for x
-        max_iterations (int, optional): _description_. Defaults to 10.
-        tolerance (float, optional): _description_. Defaults to 1e-8.
-        lambda_l2 (float, optional): Replaces AHA with AHA + lambda_l2 * I. Defaults to 1e-2.
+        x (torch.Tensor): The input tensor to be normalized.
+        per (float, optional): The percentile value used for clamping the tensor. Defaults to 0.01.
+        out_range (tuple, optional): The output range to map the normalized tensor to. Defaults to (-1, 1).
 
     Returns:
-        _type_: complex solution
+        torch.Tensor: The normalized tensor.
+
     """
+    top_per = 1 - per
+    reshaped_x = rearrange(x, "b c h w -> b c (h w)")
+
+    # clamp based on percentiles
+    if bottom is None:
+        bottom = torch.kthvalue(reshaped_x, int(per * reshaped_x.size(-1)), dim=-1)[0]
+    if top is None:
+        top = torch.kthvalue(reshaped_x, int(top_per * reshaped_x.size(-1)), dim=-1)[0]
+    clamped_tensor = torch.clamp(x, min=bottom[..., None, None], max=top[..., None, None])
+
+    # normalize to [0, 1]
+    normalized_tensor = (clamped_tensor - bottom[..., None, None]) / (top - bottom)[..., None, None]
+
+    # svale to out_range
+    normalized_tensor = normalized_tensor * (out_range[1] - out_range[0]) + out_range[0]
+
+    if return_top_bottom:
+        return normalized_tensor, top, bottom
+    else:
+        return normalized_tensor
+
+
+def ksp_loss(y_hat, y):
+    """
+    Calculates the k-space loss between the predicted k-space data (y_hat) and the ground truth k-space data (y).
+    Assumes both are complex numbers.
+
+    Args:
+        y_hat (torch.Tensor): Predicted k-space data.
+        y (torch.Tensor): Ground truth k-space data.
+
+    Returns:
+        torch.Tensor: The k-space loss.
+
+    """
+    real_loss = torch.sum((y_hat.real - y.real) ** 2, dim=(-1, -2, -3))  # sum over all dimensions except batch
+    imag_loss = torch.sum((y_hat.imag - y.imag) ** 2, dim=(-1, -2, -3))
+
+    return 0.5 * (real_loss + imag_loss)
+
+
+def complex_conjugate_gradient(AHA, AHb, x0, max_iterations: int = 10, tolerance: float = 1e-6, lambda_l2=1e-3):
+    """
+    Solves a linear system of equations using the Complex Conjugate Gradient method.
+    This function solves Ax = b, by minimizing ||Ax - b||_2^2 + lambda_l2 * ||x||_2^2.
+
+    Args:
+        AHA (callable): A function that computes the product of A and its Hermitian transpose (AHA). Assumes that the
+        input size is batched [B, C, H, W]
+        AHb (torch.Tensor): The product of A's Hermitian transpose and the target vector b.
+        x0 (torch.Tensor): The initial guess for the solution.
+        max_iterations (int, optional): The maximum number of iterations. Defaults to 10.
+        tolerance (float, optional): The convergence tolerance. Defaults to 1e-6.
+        lambda_l2 (float, optional): The L2 regularization parameter. Defaults to 1e-3.
+
+    Returns:
+        torch.Tensor: The solution to the linear system of equations.
+    """
+
     if max_iterations < 1:
         return x0
 
@@ -43,6 +100,7 @@ def complex_conjugate_gradient(AHA, AHb, x0, max_iterations: int = 10, tolerance
     p = r.clone()  # [B, C, H, W]
     x = x0.clone()  # [B, C,  H, W]
     r_dot_r = torch.real(torch.conj(r) * r).sum(dim=(-1, -2))
+
     for _ in range(max_iterations):
         AHAp = AHA_wrapper(p)
         alpha = r_dot_r / torch.real(torch.conj(p) * AHAp).sum(dim=(-1, -2))
@@ -54,22 +112,31 @@ def complex_conjugate_gradient(AHA, AHb, x0, max_iterations: int = 10, tolerance
         p = r + beta.unsqueeze(-1).unsqueeze(-1) * p
         r_dot_r = new_r_dot_r
 
+        # Since we are batching, this will stop if all of the elements in the batch have passed the threshold. Not ideal
+        # but it's the best we can do.
         if torch.sqrt(r_dot_r).max() < tolerance:
             break
 
     return x
 
 
-def normalize(x):
-    maxs = torch.max(rearrange(x, "b c h w -> b c (h w)"), dim=-1)[0]  # [B, C]
-    mins = torch.min(rearrange(x, "b c h w -> b c (h w)"), dim=-1)[0]  # [B, C]
-    x = (x - mins.unsqueeze(-1).unsqueeze(-1)) / (maxs - mins + 1e-9).unsqueeze(-1).unsqueeze(-1)  # x is now in [0, 1]
-    x = x * 2 - 1  # x is now in [-1, 1]
-
-    return x
-
-
 def get_model_output(image, device, conditioning, diffusion_model, t, mode, seg=None):
+    """
+    Get the output of a diffusion model given an input image and conditioning.
+
+    Args:
+        image (torch.Tensor): The input image at timestep t.
+        device (torch.device): The device to perform computations on.
+        conditioning (torch.Tensor): The conditioning information.
+        diffusion_model (torch.nn.Module): The diffusion model.
+        t (float): The time step.
+        mode (str): The mode of operation.
+        seg (torch.Tensor, optional): The segmentation information. Defaults to None.
+
+    Returns:
+        torch.Tensor: The output of the diffusion model.
+    """
+
     if mode == "concat":
         model_input = torch.cat([image, conditioning], dim=1)
         if isinstance(diffusion_model, SPADEDiffusionModelUNet):
@@ -88,6 +155,22 @@ def get_model_output(image, device, conditioning, diffusion_model, t, mode, seg=
 
 
 def stochastic_resampling(z_0_hat, z_t, scheduler, t, prev_t, gamma=40, simple=False):
+    """
+    Perform stochastic resampling of latent variables based on the paper https://arxiv.org/pdf/2307.08123.pdf.
+    Given some z_0, we estimate the corresponding z_t.
+
+    Args:
+        z_0_hat (torch.Tensor): A refined estimation of the latents at time 0.
+        z_t (torch.Tensor): The current latents at time t.
+        scheduler (Scheduler): The scheduler object.
+        t (int): The current time step.
+        prev_t (int): The previous time step.
+        gamma (float, optional): The gamma parameter. Defaults to 40.
+        simple (bool, optional): Whether to use the simple resampling method. Defaults to False.
+
+    Returns:
+        torch.Tensor: The resampled latent variable.
+    """
     # some schedulers don't have final_alphas_cumprod
     try:
         final_alpha_cumprod = scheduler.final_alpha_cumprod if scheduler.final_alpha_cumprod is not None else 1
@@ -96,6 +179,8 @@ def stochastic_resampling(z_0_hat, z_t, scheduler, t, prev_t, gamma=40, simple=F
 
     alpha_prod_t = scheduler.alphas_cumprod[t] if t >= 0 else final_alpha_cumprod
     alpha_prod_t_prev = scheduler.alphas_cumprod[prev_t] if prev_t >= 0 else final_alpha_cumprod
+
+    # The simple version just samples from p(z_t|z_0, y)
     if simple:
         return torch.sqrt(alpha_prod_t) * z_0_hat + torch.sqrt(1 - alpha_prod_t) * torch.randn_like(z_0_hat)
 
@@ -110,80 +195,115 @@ def stochastic_resampling(z_0_hat, z_t, scheduler, t, prev_t, gamma=40, simple=F
     return z_t_resapmled
 
 
-def ksp_loss(y_hat, y):
-    real_loss = torch.sum((y_hat.real - y.real) ** 2)
-    imag_loss = torch.sum((y_hat.imag - y.imag) ** 2)
+def debug_plot(x, i=0):
+    plt.imshow(x[i, 0, :, :].cpu().detach().numpy(), "gray")
+    plt.colorbar()
+    plt.show()
+    plt.close()
 
-    return 0.5 * (real_loss + imag_loss)
 
+def dc_latent_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor, verbose=True):
+    """
+    Performs data consistency optimization in latent space.
 
-# TODO: this is one direction, in the appendix they also add the image version of it
-# TODO: documentation
-def dc_latent_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor):
+    Args:
+        forward_model (torch.nn.Module): The forward model used for reconstruction.
+        autoencoder (torch.nn.Module): The latent autoencoder.
+        opt_params (dict): Optimization parameters including n_iters, lr, and threshold.
+        y (torch.Tensor): Measurements.
+        z_0 (torch.Tensor): The initial latent variable.
+        scale_factor (float): The scale factor used for decoding.
+
+    Returns:
+        torch.Tensor: The optimized latent variable.
+    """
     assert z_0.device == y.device, "z_0 and y must be on the same device"
 
     n_iters = opt_params["n_iters"]
     lr = opt_params["lr"]
     threshold = opt_params["threshold"]
+    norm_per = opt_params["norm_per"]
 
     z_opt = z_0.clone().detach().requires_grad_(True)
     optimizer = torch.optim.Adam([z_opt], lr=lr)
 
-    for _ in tqdm(range(n_iters), desc="DC optimization", leave=False):
-        optimizer.zero_grad()
+    # calculate normalization parameters based on the initial image
+    with torch.no_grad():
         im_opt = autoencoder.decode_stage_2_outputs(z_opt / scale_factor)
+        _, top, bottom = normalize(im_opt, per=norm_per, out_range=(0, 1), return_top_bottom=True)
+
+    progress_bar = tqdm(total=n_iters, disable=not verbose, leave=False)
+
+    for i in range(n_iters):
+        optimizer.zero_grad()
+        # Estimate image
+        im_opt = autoencoder.decode_stage_2_outputs(z_opt / scale_factor)
+        im_opt = normalize(im_opt, per=norm_per, out_range=(0, 1), top=top, bottom=bottom, return_top_bottom=False)
+        # Pass through the forward model
         y_hat = forward_model(im_opt)
-        loss = ksp_loss(y_hat, y)
+        batch_loss = ksp_loss(y_hat, y)
+        loss = torch.mean(batch_loss)
         loss.backward()
         optimizer.step()
 
-        if loss <= threshold:
+        if verbose:
+            progress_bar.set_description(
+                f"DC latent optimization {i+1}/{n_iters} - Loss: {loss}"
+            )  # Update the progress bar description with loss
+            progress_bar.update(1)
+
+        # ideally the stopping point for different images would be different but we want batching for efficiency
+        if batch_loss.max() <= threshold:
             break
+
+    progress_bar.close()
 
     return z_opt
 
 
-def normalize(x, per=0.05, out_range=(-1, 1)):
-    top_per = 1 - per
-    reshaped_x = rearrange(x, "b c h w -> b c (h w)")
+def dc_image_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor, encode_output=True):
+    """
+    Perform data consistency optimization in image space.
 
-    # clamp based on percentiles
-    bottom = torch.kthvalue(reshaped_x, int(per * reshaped_x.size(-1)), dim=-1)[0]
-    top = torch.kthvalue(reshaped_x, int(top_per * reshaped_x.size(-1)), dim=-1)[0]
-    clamped_tensor = torch.clamp(x, min=bottom[..., None, None], max=top[..., None, None])
+    Args:
+        forward_model (object): The forward model used for image reconstruction.
+        autoencoder (object): The autoencoder model.
+        opt_params (dict): Optimization parameters including n_iters, threshold, lambda_l2, and norm_per.
+        y (torch.Tensor): Measurements.
+        z_0 (torch.Tensor): The initial latent space representation.
+        scale_factor (float): The scale factor used for encoding and decoding.
+        encode_output (bool, optional): Whether to encode the output image back to latent space. Defaults to True.
 
-    # normalize to [0, 1]
-    normalized_tensor = (clamped_tensor - bottom[..., None, None]) / (top - bottom)[..., None, None]
-
-    # normalize to out_range
-    normalized_tensor = normalized_tensor * (out_range[1] - out_range[0]) + out_range[0]
-
-    return normalized_tensor
-
-
-def dc_image_optimization(
-    forward_model, autoencoder, opt_params, y, z_0, scale_factor, encode_output=True, lambda_l2=0
-):
+    Returns:
+        torch.Tensor: The optimized latent space representation if encode_output is True, otherwise the optimized image.
+    """
     assert z_0.device == y.device, "z_0 and y must be on the same device"
 
-    # TODO: use CG parameters
+    n_iters = opt_params["n_iters"]
+    threshold = opt_params["threshold"]
+    lambda_l2 = opt_params["lambda_l2"]
+    norm_per = opt_params["norm_per"]
 
     # go to image space
     x_0 = autoencoder.decode_stage_2_outputs(z_0 / scale_factor)
-    # This will be an image in the range [-1, 1] + noise, we need to scale it to [0, 1] for the forward model
-    x_0 = normalize(x_0, 0.01, (0, 1))
-    # x_0 = torch.zeros_like(x_0)
 
-    # optimize in image space
+    # This will be an image in the range [-1, 1] + noise, we need to scale it to [0, 1] for the forward model
+    x_0 = normalize(x_0, norm_per, (0, 1))
+
     AHA = forward_model.normal
     AHb = forward_model.conjugate(y)
-    x_0_opt = complex_conjugate_gradient(AHA, AHb, x_0, lambda_l2=lambda_l2)
-    x_0_opt = x_0_opt.abs()
-    # This is an image in the range [0, 1] + noise, we need to scale it to [-1, 1] for the autoencoder
-    x_0_opt = normalize(x_0_opt, 0.01, (-1, 1)).type(torch.float32)
 
+    x_0_opt = (
+        complex_conjugate_gradient(AHA, AHb, x_0, max_iterations=n_iters, tolerance=threshold, lambda_l2=lambda_l2)
+        .abs()
+        .type(torch.float32)
+    )
+
+    # The output image in the range [0, 1] + noise, we need to scale it to [-1, 1] for the autoencoder
+    x_0_opt = normalize(x_0_opt, norm_per, (-1, 1)).type(torch.float32)
+
+    # If we want to go back to latent space
     if encode_output:
-        # go back to latent space
         z_0_opt = autoencoder.encode_stage_2_inputs(x_0_opt) * scale_factor
 
         return z_0_opt
@@ -193,9 +313,7 @@ def dc_image_optimization(
 
 class DiffusionDCInferer(Inferer):
     """
-    DiffusionDCInferer takes a trained diffusion model and a scheduler and can be used to perform a signal forward pass
-    for a training iteration, and sample from the model.
-
+    DiffusionDCInferer takes a trained diffusion model and a scheduler and can be used to sample with data consistency.
 
     Args:
         scheduler: diffusion scheduler.
@@ -205,6 +323,7 @@ class DiffusionDCInferer(Inferer):
         Inferer.__init__(self)
         self.scheduler = scheduler
 
+    # We only want to sample but must have this function...
     def __call__(
         self,
         inputs: torch.Tensor,
@@ -249,15 +368,16 @@ class DiffusionDCInferer(Inferer):
             mode: Conditioning mode for the network.
             verbose: if true, prints the progression bar of the sampling process.
             seg: if diffusion model is instance of SPADEDiffusionModel, segmentation must be provided.
-            image_dc_timesteps: Iterations to apply data consistency (DC) in image space.
-            If None, no data consistency is applied.
+            image_dc_timesteps: Step indices to apply data consistency (DC) in image space.
+            If None, no data consistency in image space is applied.
             latent_dc_timesteps: Iterations to apply data consistency (DC) in latent space.
-            If None, no data consistency is applied.
+            If None, no data consistency in latent space is applied.
             forward_model: Forward model to be used in DC.
             autoencoder: Autoencoder.
-            opt_params: Optimizer parameters for DC.
+            opt_params: Optimizer parameters for data consistency.
             gamma: Gamma parameter for stochastic resampling.
             y: measurements.
+            scale_factor: Scale factor for latent space.
         """
         if mode not in ["crossattn", "concat"]:
             raise NotImplementedError(f"{mode} condition is not supported")
@@ -286,24 +406,36 @@ class DiffusionDCInferer(Inferer):
             # ---- Main added part compared to the regular implementation ---- #
             # 3. apply data consistency Following https://arxiv.org/pdf/2307.08123.pdf
             if (t in latent_dc_timesteps) or (t in image_dc_timesteps):
-                # predict original sample z_0
-                # TODO: what is the input noise here?
+                # predict original sample z_0 -- the schedulers can do this for us
                 prev_timestep = t - num_train_timesteps // num_inference_steps
+                # Model estimation for the previous timestep
                 model_output = get_model_output(
                     image, input_noise, conditioning, diffusion_model, prev_timestep, mode, seg=seg
                 )
+                # z_0 estimation based on the previous timestep
                 _, z_0 = scheduler.step(model_output, prev_timestep, image)
 
-                # solve DC optimization -- have to enable gradients since they were disabled in the sampling process
-                # TODO: maybe adding some prior knowledge in the DC step might help (CS wavelet)
+                # solve DC optimization
+                # TODO in the future: Since we are mainly interested in MRI applications, we can add domain specific
+                # regularization in the DC step, such as total variation, wavelet, or even a learning a regularizer.
                 if t in latent_dc_timesteps:
+                    # have to enable gradients since they were disabled in the sampling process
                     with torch.enable_grad():
-                        z_0_opt = dc_latent_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor)
+                        z_0_opt = dc_latent_optimization(
+                            forward_model, autoencoder, opt_params["latent_space_opt_params"], y, z_0, scale_factor
+                        )
                 else:
-                    z_0_opt = dc_image_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor)
+                    z_0_opt = dc_image_optimization(
+                        forward_model,
+                        autoencoder,
+                        opt_params["img_space_opt_params"],
+                        y,
+                        z_0,
+                        scale_factor,
+                        encode_output=True,
+                    )
 
                 # map back to z_t
-                # TODO: make sure that t-1 here is correct
                 prev_prev_timestep = prev_timestep - num_train_timesteps // num_inference_steps
                 image = stochastic_resampling(
                     z_0_opt, image, scheduler, prev_timestep, prev_prev_timestep, gamma, simple=False
@@ -317,11 +449,10 @@ class DiffusionDCInferer(Inferer):
             return image
 
 
-# TODO: update doc
 class LatentDiffusionDCInferer(DiffusionDCInferer):
     """
-    LatentDiffusionInferer takes a stage 1 model (VQVAE or AutoencoderKL), diffusion model, and a scheduler, and can
-    be used to perform a signal forward pass for a training iteration, and sample from the model.
+    LatentDiffusionDCInferer takes a stage 1 model (VQVAE or AutoencoderKL), diffusion model, and a scheduler, and can
+    be used to sample from the model.
 
     Args:
         scheduler: a scheduler to be used in combination with `unet` to denoise the encoded image latents.
@@ -349,6 +480,7 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
             self.ldm_resizer = SpatialPad(spatial_size=[-1] + self.ldm_latent_shape)
             self.autoencoder_resizer = CenterSpatialCrop(roi_size=[-1] + self.autoencoder_latent_shape)
 
+    # We only want to sample but must have this function...
     def __call__(
         self,
         inputs: torch.Tensor,
@@ -362,7 +494,6 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
     ) -> torch.Tensor:
         pass
 
-    # TODO: can we get the scale factor from somewhere?
     @torch.no_grad()
     def sample(
         self,
@@ -382,8 +513,7 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
         opt_params: dict | None = None,
         gamma: float = 40,
         y: torch.Tensor | None = None,
-        scale_factor: torch.Tensor | None = None,
-        output_dc_steps: int = 0,
+        output_dc_opt_params: dict | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -397,7 +527,16 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
             mode: Conditioning mode for the network.
             verbose: if true, prints the progression bar of the sampling process.
             seg: if diffusion model is instance of SPADEDiffusionModel, or autoencoder_model
-             is instance of SPADEAutoencoderKL, segmentation must be provided.
+            is instance of SPADEAutoencoderKL, segmentation must be provided.
+            image_dc_timesteps: Step indices to apply data consistency (DC) in image space.
+            If None, no data consistency in image space is applied.
+            latent_dc_timesteps: Iterations to apply data consistency (DC) in latent space.
+            If None, no data consistency in latent space is applied.
+            forward_model: Forward model to be used in DC.
+            opt_params: Optimizer parameters for data consistency.
+            gamma: Gamma parameter for stochastic resampling.
+            y: measurements.
+            output_dc_opt_params: Optimizer parameters for data consistency in the output of the diffusion process.
         """
 
         if (
@@ -428,7 +567,7 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
                 opt_params=opt_params,
                 gamma=gamma,
                 y=y,
-                scale_factor=scale_factor,
+                scale_factor=self.scale_factor,
             )
         else:
             outputs = super().sample(
@@ -447,7 +586,7 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
                 opt_params=opt_params,
                 gamma=gamma,
                 y=y,
-                scale_factor=scale_factor,
+                scale_factor=self.scale_factor,
             )
 
         if save_intermediates:
@@ -461,7 +600,7 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
 
         # Refine the estimation with a small number of CG steps
         image = dc_image_optimization(
-            forward_model, autoencoder_model, opt_params, y, latent, scale_factor, False, lambda_l2=1e-2
+            forward_model, autoencoder_model, output_dc_opt_params, y, latent, self.scale_factor, False
         )
 
         if save_intermediates:
