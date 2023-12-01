@@ -3,44 +3,102 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 
+import matplotlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 from generative.networks.nets import SPADEAutoencoderKL, SPADEDiffusionModelUNet
 from monai.inferers import Inferer
 from monai.transforms import CenterSpatialCrop, SpatialPad
 from monai.utils import optional_import
 
+matplotlib.use("webagg")
+import matplotlib.pyplot as plt
+
 tqdm, has_tqdm = optional_import("tqdm", name="tqdm")
 
 
-def get_model_output(image, input_noise, conditioning, diffusion_model, t, mode, seg=None):
+def complex_conjugate_gradient(AHA, AHb, x0, max_iterations: int = 10, tolerance: float = 1e-6, lambda_l2=0):
+    """Conjugate gradient for complex numbers. The output is also complex.
+    Solve for argmin ||Ax - b||^2
+
+    Args:
+        AHA (linear operator):
+        AHb: see optimization definition
+        x0: initial guess for x
+        max_iterations (int, optional): _description_. Defaults to 10.
+        tolerance (float, optional): _description_. Defaults to 1e-8.
+        lambda_l2 (float, optional): Replaces AHA with AHA + lambda_l2 * I. Defaults to 1e-2.
+
+    Returns:
+        _type_: complex solution
+    """
+    if max_iterations < 1:
+        return x0
+
+    AHA_wrapper = lambda x: AHA(x) + lambda_l2 * x
+
+    r = AHb - AHA_wrapper(x0)  # [B, C, H, W]
+    p = r.clone()  # [B, C, H, W]
+    x = x0.clone()  # [B, C,  H, W]
+    r_dot_r = torch.real(torch.conj(r) * r).sum(dim=(-1, -2))
+    for _ in range(max_iterations):
+        AHAp = AHA_wrapper(p)
+        alpha = r_dot_r / torch.real(torch.conj(p) * AHAp).sum(dim=(-1, -2))
+        x = x + alpha.unsqueeze(-1).unsqueeze(-1) * p
+        r = r - alpha.unsqueeze(-1).unsqueeze(-1) * AHAp
+
+        new_r_dot_r = torch.real(torch.conj(r) * r).sum(dim=(-1, -2))
+        beta = new_r_dot_r / r_dot_r
+        p = r + beta.unsqueeze(-1).unsqueeze(-1) * p
+        r_dot_r = new_r_dot_r
+
+        if torch.sqrt(r_dot_r).max() < tolerance:
+            break
+
+    return x
+
+
+def normalize(x):
+    maxs = torch.max(rearrange(x, "b c h w -> b c (h w)"), dim=-1)[0]  # [B, C]
+    mins = torch.min(rearrange(x, "b c h w -> b c (h w)"), dim=-1)[0]  # [B, C]
+    x = (x - mins.unsqueeze(-1).unsqueeze(-1)) / (maxs - mins + 1e-9).unsqueeze(-1).unsqueeze(-1)  # x is now in [0, 1]
+    x = x * 2 - 1  # x is now in [-1, 1]
+
+    return x
+
+
+def get_model_output(image, device, conditioning, diffusion_model, t, mode, seg=None):
     if mode == "concat":
         model_input = torch.cat([image, conditioning], dim=1)
         if isinstance(diffusion_model, SPADEDiffusionModelUNet):
-            model_output = diffusion_model(
-                model_input, timesteps=torch.Tensor((t,)).to(input_noise.device), context=None, seg=seg
-            )
+            model_output = diffusion_model(model_input, timesteps=torch.Tensor((t,)).to(device), context=None, seg=seg)
         else:
-            model_output = diffusion_model(
-                model_input, timesteps=torch.Tensor((t,)).to(input_noise.device), context=None
-            )
+            model_output = diffusion_model(model_input, timesteps=torch.Tensor((t,)).to(device), context=None)
     else:
         if isinstance(diffusion_model, SPADEDiffusionModelUNet):
             model_output = diffusion_model(
-                image, timesteps=torch.Tensor((t,)).to(input_noise.device), context=conditioning, seg=seg
+                image, timesteps=torch.Tensor((t,)).to(device), context=conditioning, seg=seg
             )
         else:
-            model_output = diffusion_model(
-                image, timesteps=torch.Tensor((t,)).to(input_noise.device), context=conditioning
-            )
+            model_output = diffusion_model(image, timesteps=torch.Tensor((t,)).to(device), context=conditioning)
 
     return model_output
 
 
-def stochastic_resampling(z_0_hat, z_t, scheduler, t, gamma=40):
-    alpha_prod_t = scheduler.alphas_cumprod[t]
-    alpha_prod_t_prev = scheduler.alphas_cumprod[t - 1] if t - 1 >= 0 else scheduler.final_alpha_cumprod
+def stochastic_resampling(z_0_hat, z_t, scheduler, t, prev_t, gamma=40, simple=False):
+    # some schedulers don't have final_alphas_cumprod
+    try:
+        final_alpha_cumprod = scheduler.final_alpha_cumprod if scheduler.final_alpha_cumprod is not None else 1
+    except:
+        final_alpha_cumprod = 1
+
+    alpha_prod_t = scheduler.alphas_cumprod[t] if t >= 0 else final_alpha_cumprod
+    alpha_prod_t_prev = scheduler.alphas_cumprod[prev_t] if prev_t >= 0 else final_alpha_cumprod
+    if simple:
+        return torch.sqrt(alpha_prod_t) * z_0_hat + torch.sqrt(1 - alpha_prod_t) * torch.randn_like(z_0_hat)
+
     var_t = gamma * ((1 - alpha_prod_t_prev) / alpha_prod_t) * (1 - (alpha_prod_t / alpha_prod_t_prev))
 
     # equation (13) in https://arxiv.org/pdf/2307.08123.pdf
@@ -55,12 +113,13 @@ def stochastic_resampling(z_0_hat, z_t, scheduler, t, gamma=40):
 def ksp_loss(y_hat, y):
     real_loss = torch.sum((y_hat.real - y.real) ** 2)
     imag_loss = torch.sum((y_hat.imag - y.imag) ** 2)
-    
+
     return 0.5 * (real_loss + imag_loss)
+
 
 # TODO: this is one direction, in the appendix they also add the image version of it
 # TODO: documentation
-def dc_optimization(forward_model, decoder, opt_params, y, z_0):
+def dc_latent_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor):
     assert z_0.device == y.device, "z_0 and y must be on the same device"
 
     n_iters = opt_params["n_iters"]
@@ -68,11 +127,11 @@ def dc_optimization(forward_model, decoder, opt_params, y, z_0):
     threshold = opt_params["threshold"]
 
     z_opt = z_0.clone().detach().requires_grad_(True)
-    optimizer = torch.optim.SGD([z_opt], lr=lr)
+    optimizer = torch.optim.Adam([z_opt], lr=lr)
 
     for _ in tqdm(range(n_iters), desc="DC optimization", leave=False):
         optimizer.zero_grad()
-        im_opt = decoder(z_opt)
+        im_opt = autoencoder.decode_stage_2_outputs(z_opt / scale_factor)
         y_hat = forward_model(im_opt)
         loss = ksp_loss(y_hat, y)
         loss.backward()
@@ -82,6 +141,54 @@ def dc_optimization(forward_model, decoder, opt_params, y, z_0):
             break
 
     return z_opt
+
+
+def normalize(x, per=0.05, out_range=(-1, 1)):
+    top_per = 1 - per
+    reshaped_x = rearrange(x, "b c h w -> b c (h w)")
+
+    # clamp based on percentiles
+    bottom = torch.kthvalue(reshaped_x, int(per * reshaped_x.size(-1)), dim=-1)[0]
+    top = torch.kthvalue(reshaped_x, int(top_per * reshaped_x.size(-1)), dim=-1)[0]
+    clamped_tensor = torch.clamp(x, min=bottom[..., None, None], max=top[..., None, None])
+
+    # normalize to [0, 1]
+    normalized_tensor = (clamped_tensor - bottom[..., None, None]) / (top - bottom)[..., None, None]
+
+    # normalize to out_range
+    normalized_tensor = normalized_tensor * (out_range[1] - out_range[0]) + out_range[0]
+
+    return normalized_tensor
+
+
+def dc_image_optimization(
+    forward_model, autoencoder, opt_params, y, z_0, scale_factor, encode_output=True, lambda_l2=0
+):
+    assert z_0.device == y.device, "z_0 and y must be on the same device"
+
+    # TODO: use CG parameters
+
+    # go to image space
+    x_0 = autoencoder.decode_stage_2_outputs(z_0 / scale_factor)
+    # This will be an image in the range [-1, 1] + noise, we need to scale it to [0, 1] for the forward model
+    x_0 = normalize(x_0, 0.01, (0, 1))
+    # x_0 = torch.zeros_like(x_0)
+
+    # optimize in image space
+    AHA = forward_model.normal
+    AHb = forward_model.conjugate(y)
+    x_0_opt = complex_conjugate_gradient(AHA, AHb, x_0, lambda_l2=lambda_l2)
+    x_0_opt = x_0_opt.abs()
+    # This is an image in the range [0, 1] + noise, we need to scale it to [-1, 1] for the autoencoder
+    x_0_opt = normalize(x_0_opt, 0.01, (-1, 1)).type(torch.float32)
+
+    if encode_output:
+        # go back to latent space
+        z_0_opt = autoencoder.encode_stage_2_inputs(x_0_opt) * scale_factor
+
+        return z_0_opt
+    else:
+        return x_0_opt
 
 
 class DiffusionDCInferer(Inferer):
@@ -122,13 +229,14 @@ class DiffusionDCInferer(Inferer):
         mode: str = "crossattn",
         verbose: bool = True,
         seg: torch.Tensor | None = None,
-        dc_timesteps: Sequence[int] | None = None,
+        image_dc_timesteps: Sequence[int] | None = None,
+        latent_dc_timesteps: Sequence[int] | None = None,
         forward_model: Callable[..., torch.Tensor] | None = None,
-        decoder: Callable[..., torch.Tensor] | None = None,
-        encoder: Callable[..., torch.Tensor] | None = None,
+        autoencoder: Callable[..., torch.Tensor] | None = None,
         opt_params: dict | None = None,
         gamma: float = 40,
         y: torch.Tensor | None = None,
+        scale_factor: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -141,10 +249,12 @@ class DiffusionDCInferer(Inferer):
             mode: Conditioning mode for the network.
             verbose: if true, prints the progression bar of the sampling process.
             seg: if diffusion model is instance of SPADEDiffusionModel, segmentation must be provided.
-            dc_timesteps: Iterations to apply data consistency (DC). If None, no data consistency is applied.
+            image_dc_timesteps: Iterations to apply data consistency (DC) in image space.
+            If None, no data consistency is applied.
+            latent_dc_timesteps: Iterations to apply data consistency (DC) in latent space.
+            If None, no data consistency is applied.
             forward_model: Forward model to be used in DC.
-            decoder: latent decoder.
-            encoder: latent encoder.
+            autoencoder: Autoencoder.
             opt_params: Optimizer parameters for DC.
             gamma: Gamma parameter for stochastic resampling.
             y: measurements.
@@ -160,29 +270,44 @@ class DiffusionDCInferer(Inferer):
         else:
             progress_bar = iter(scheduler.timesteps)
         intermediates = []
+        num_train_timesteps = scheduler.num_train_timesteps
+        num_inference_steps = (
+            scheduler.num_inference_steps
+            if scheduler.num_inference_steps is not None
+            else scheduler.num_train_timesteps
+        )
         for t in progress_bar:
             # 1. predict noise model_output
-            model_output = get_model_output(image, input_noise, conditioning, diffusion_model, t, mode, seg=seg)
+            model_output = get_model_output(image, input_noise.device, conditioning, diffusion_model, t, mode, seg=seg)
 
             # 2. compute previous image: x_t -> x_t-1
             image, _ = scheduler.step(model_output, t, image)
 
             # ---- Main added part compared to the regular implementation ---- #
             # 3. apply data consistency Following https://arxiv.org/pdf/2307.08123.pdf
-            if t in dc_timesteps:
+            if (t in latent_dc_timesteps) or (t in image_dc_timesteps):
                 # predict original sample z_0
                 # TODO: what is the input noise here?
-                prev_timestep = t - scheduler.num_train_timesteps // scheduler.num_inference_steps
-                model_output = get_model_output(image, input_noise, conditioning, diffusion_model, prev_timestep, mode, seg=seg)
-                _, z_0 = scheduler.step(model_output, prev_timestep, input_noise)
+                prev_timestep = t - num_train_timesteps // num_inference_steps
+                model_output = get_model_output(
+                    image, input_noise, conditioning, diffusion_model, prev_timestep, mode, seg=seg
+                )
+                _, z_0 = scheduler.step(model_output, prev_timestep, image)
 
                 # solve DC optimization -- have to enable gradients since they were disabled in the sampling process
-                with torch.enable_grad():
-                    z_0_opt = dc_optimization(forward_model, decoder, opt_params, y, z_0)
+                # TODO: maybe adding some prior knowledge in the DC step might help (CS wavelet)
+                if t in latent_dc_timesteps:
+                    with torch.enable_grad():
+                        z_0_opt = dc_latent_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor)
+                else:
+                    z_0_opt = dc_image_optimization(forward_model, autoencoder, opt_params, y, z_0, scale_factor)
 
                 # map back to z_t
                 # TODO: make sure that t-1 here is correct
-                image = stochastic_resampling(z_0_opt, image, scheduler, prev_timestep, gamma)
+                prev_prev_timestep = prev_timestep - num_train_timesteps // num_inference_steps
+                image = stochastic_resampling(
+                    z_0_opt, image, scheduler, prev_timestep, prev_prev_timestep, gamma, simple=False
+                )
 
             if save_intermediates and t % intermediate_steps == 0:
                 intermediates.append(image)
@@ -237,6 +362,7 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
     ) -> torch.Tensor:
         pass
 
+    # TODO: can we get the scale factor from somewhere?
     @torch.no_grad()
     def sample(
         self,
@@ -250,11 +376,14 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
         mode: str = "crossattn",
         verbose: bool = True,
         seg: torch.Tensor | None = None,
-        dc_timesteps: Sequence[int] | None = None,
+        image_dc_timesteps: Sequence[int] | None = None,
+        latent_dc_timesteps: Sequence[int] | None = None,
         forward_model: Callable[..., torch.Tensor] | None = None,
         opt_params: dict | None = None,
         gamma: float = 40,
         y: torch.Tensor | None = None,
+        scale_factor: torch.Tensor | None = None,
+        output_dc_steps: int = 0,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
         """
         Args:
@@ -292,13 +421,14 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
                 mode=mode,
                 verbose=verbose,
                 seg=seg,
-                dc_timesteps=dc_timesteps,
+                image_dc_timesteps=image_dc_timesteps,
+                latent_dc_timesteps=latent_dc_timesteps,
                 forward_model=forward_model,
-                decoder=autoencoder_model.decoder,
-                encoder=autoencoder_model.encoder,
+                autoencoder=autoencoder_model,
                 opt_params=opt_params,
                 gamma=gamma,
-                y=y
+                y=y,
+                scale_factor=scale_factor,
             )
         else:
             outputs = super().sample(
@@ -310,13 +440,14 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
                 conditioning=conditioning,
                 mode=mode,
                 verbose=verbose,
-                dc_timesteps=dc_timesteps,
+                image_dc_timesteps=image_dc_timesteps,
+                latent_dc_timesteps=latent_dc_timesteps,
                 forward_model=forward_model,
-                decoder=autoencoder_model.decoder,
-                encoder=autoencoder_model.encoder,
+                autoencoder=autoencoder_model,
                 opt_params=opt_params,
                 gamma=gamma,
-                y=y
+                y=y,
+                scale_factor=scale_factor,
             )
 
         if save_intermediates:
@@ -328,7 +459,10 @@ class LatentDiffusionDCInferer(DiffusionDCInferer):
             latent = self.autoencoder_resizer(latent)
             latent_intermediates = [self.autoencoder_resizer(l) for l in latent_intermediates]
 
-        image = autoencoder_model.decode_stage_2_outputs(latent / self.scale_factor)
+        # Refine the estimation with a small number of CG steps
+        image = dc_image_optimization(
+            forward_model, autoencoder_model, opt_params, y, latent, scale_factor, False, lambda_l2=1e-2
+        )
 
         if save_intermediates:
             intermediates = []
